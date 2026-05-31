@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ppp"
+version = "0.1.0"
+description = "ProtoMotions SMPL mimic inference on ovphysx + ovrtx"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+authors = [{ name = "PPP authors" }]
+dependencies = [
+    # Physics + rendering runtime.
+    # ovrtx is not on PyPI today; install the wheel from
+    # https://github.com/nvidia-omniverse/ovrtx/releases manually.
+    "ovphysx>=0.2.9",
+    # Inference.
+    "onnxruntime>=1.17",
+    # Core stack. torch is required by protomotions and by the obs builders.
+    "numpy>=1.24",
+    "torch>=2.1",
+    # Windowed display of ovrtx LdrColor frames.
+    "pygame>=2.5",
+    "pillow>=10.0",
+    # Misc utility deps already pulled in by protomotions but listed for clarity.
+    "easydict>=1.10",
+    "pyyaml>=6.0",
+    "tensordict>=0.4",
+]
+
+[project.optional-dependencies]
+# Install ovrtx separately, e.g.:
+#   pip install path\to\ovrtx-<version>-cp311-cp311-win_amd64.whl
+# Or rely on scripts/install_ovrtx.ps1 to fetch the latest release wheel.
+
+[project.scripts]
+ppp-inference = "ppp.app:cli_main"
+
+[tool.setuptools]
+packages = ["ppp"]

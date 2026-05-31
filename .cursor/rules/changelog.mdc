@@ -1,0 +1,63 @@
+---
+description: Keep CHANGELOG.md current for every user-visible code change in PPP
+alwaysApply: true
+---
+
+# Maintain `CHANGELOG.md`
+
+Every time you make a code, config, or asset change that a user (or future
+agent) would care about, add a corresponding entry to `CHANGELOG.md` at the
+repo root in the **same response** that makes the change. Do not defer.
+
+## What counts as "user-visible"
+
+Add an entry for:
+
+- Behaviour changes (bug fixes, new features, breaking changes, removed code paths).
+- New or removed dependencies, scripts, or CLI flags.
+- New or moved files in `ppp/`, `scripts/`, or `run_inference.py`.
+- Changes to the runtime USD layout, ovphysx/ovrtx interaction, or
+  inference pipeline (obs, policy, action processing).
+- Anything you'd want a reviewer to see in a PR description.
+
+Skip pure formatting, comment-only edits, and changes that exist solely
+inside `CHANGELOG.md` itself.
+
+## Format
+
+Follow the "Keep a Changelog" style with reverse-chronological entries
+under an `## [Unreleased]` heading. Group items under one of:
+
+- `### Added`
+- `### Changed`
+- `### Fixed`
+- `### Removed`
+- `### Deprecated`
+- `### Security`
+
+When the user tags a release, rename `[Unreleased]` to the version + ISO
+date (e.g. `## [0.2.0] - 2026-05-19`) and start a fresh `[Unreleased]`.
+
+## Style
+
+- One bullet per logical change; reference the file(s) in backticks.
+- Lead with the *why* when it isn't obvious from the *what*.
+- Keep entries short (one or two sentences). Long rationales belong in
+  commit messages or in-code comments, not the changelog.
+- Reference issues / PRs as `(#123)` when applicable.
+
+## Concrete example
+
+```markdown
+## [Unreleased]
+
+### Fixed
+- Ground prim in `ppp/assets.py` now overrides the upstream
+  `physics:collisionEnabled = 0` so the SMPL humanoid actually rests on
+  the checkerboard under ovphysx (was falling through).
+
+### Changed
+- `ppp/remote_renderer.py` shutdown now sends a `bye` ack from the child
+  after `viewer.close()` and only falls back to `terminate()` after a 3s
+  grace; matches NVIDIA SimReadyBrowser's documented pattern.
+```

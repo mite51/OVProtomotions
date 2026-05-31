@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+*.egg-info/
+build/
+dist/
+_runtime_scene.usda
+_output/
+.cache/
+.idea/
+.vscode/
