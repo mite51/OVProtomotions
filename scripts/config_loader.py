@@ -1,30 +1,36 @@
-"""Load ``resolved_configs_inference.pt`` (or fall back to hard-coded SMPL).
+"""Load the ONNX sidecar YAML (``unified_pipeline.yaml`` and friends).
 
-The motion-tracker checkpoint directory ships:
+The new ProtoMotions export (``deployment/export_bm_tracker_onnx.py``) bakes
+the observation computation *into* the ONNX graph. Together with the ONNX
+file it writes a rich YAML sidecar that fully describes the deployment
+contract: input names + shapes, output names, joint / body orderings,
+PD gains, control timing, and the future-step indices the policy was
+trained against. PPP's inference loop is driven entirely from that YAML
+— no more rummaging through the trainer's ``resolved_configs_inference.pt``
+blob and reconstructing fields by hand.
 
-- ``last.ckpt``
-- ``resolved_configs_inference.pt`` (a pickled ``EnvConfig`` plus
-  ``AgentConfig``)
-- ``resolved_configs_inference.yaml`` (human-readable copy)
-
-We only need a small slice of the env config: body names, DOF names, action
-config (offset, scale), and a few timings (num_state_history_steps,
-future_steps). All defaults match the SMPL motion-tracker resolved config so
-the app can still boot if the .pt is missing.
+See ``docs/onnx_input_migration.md`` for the full new-input rundown.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 log = logging.getLogger(__name__)
 
 
+# ----------------------------------------------------------------------
+# SMPL fallbacks
+#
+# The YAML sidecar carries everything PPP needs at runtime, but a few
+# fields (effort_limit, velocity_limit) are sometimes ``null`` in the
+# dump. We fall back to the canonical SMPL group table from
+# ``protomotions/robot_configs/smpl.py::SMPLRobotConfig.control``.
+# ----------------------------------------------------------------------
 SMPL_BODY_NAMES: List[str] = [
     "Pelvis", "L_Hip", "L_Knee", "L_Ankle", "L_Toe",
     "R_Hip", "R_Knee", "R_Ankle", "R_Toe",
@@ -33,11 +39,6 @@ SMPL_BODY_NAMES: List[str] = [
     "R_Thorax", "R_Shoulder", "R_Elbow", "R_Wrist", "R_Hand",
 ]
 
-# SMPL kinematic tree (parent body index per body, -1 for the articulation
-# root). Hard-coded mirror of ``robot.kinematic_info.parent_indices`` from
-# ``resolved_configs_inference.{yaml,pt}`` for the motion-tracker SMPL
-# config; used as the fallback when the .pt blob is missing or doesn't
-# carry parent indices. Verified bit-for-bit against the .yaml.
 SMPL_PARENT_INDICES: List[int] = [
     -1,  0,  1,  2,  3,  0,  5,  6,  7,  0,
      9, 10, 11, 12, 11, 14, 15, 16, 17, 11,
@@ -57,15 +58,11 @@ SMPL_DOF_NAMES: List[str] = [
 ]
 
 
-# Per-joint-group PD gain table from
-# ``protomotions/robot_configs/smpl.py::SMPLRobotConfig.control``. The
-# trainer applies these via ``override_control_info`` regex matching on
-# DOF names (one entry per joint × {x, y, z}); we mirror the regexes as
-# a flat per-DOF table so PPP boots correctly when the .pt blob is
-# missing or doesn't carry ``robot.control.control_info``. The yaml
-# dump confirms these values land verbatim in the resolved config.
+# (regex-fragment-list, stiffness, damping, effort_limit, velocity_limit)
+# Used only as a fallback when the YAML doesn't carry per-DOF gains;
+# the unified-pipeline export always ships explicit per-DOF arrays so
+# this is rarely exercised in practice.
 _SMPL_GROUP_GAINS = (
-    # (regex-fragment-list, stiffness, damping, effort_limit, velocity_limit)
     (("Hip", "Knee", "Ankle"),                     800.0, 80.0,  500.0, 100.0),
     (("Toe",),                                     500.0, 50.0,  500.0, 100.0),
     (("Torso", "Spine", "Chest"),                 1000.0, 100.0, 500.0, 100.0),
@@ -75,13 +72,7 @@ _SMPL_GROUP_GAINS = (
 )
 
 
-def _smpl_default_gain_table() -> tuple[List[float], List[float], List[float], List[float]]:
-    """Build per-DOF (kp, kd, effort, velocity) lists in :data:`SMPL_DOF_NAMES` order.
-
-    Walks each joint name, finds the matching SMPL group, and emits the
-    group's gains for every axis suffix. Used as the fallback when the
-    checkpoint .pt doesn't carry ``robot.control.control_info``.
-    """
+def _smpl_default_gain_table() -> Tuple[List[float], List[float], List[float], List[float]]:
     kp: List[float] = []
     kd: List[float] = []
     eff: List[float] = []
@@ -108,34 +99,53 @@ _SMPL_KP_DEFAULT, _SMPL_KD_DEFAULT, _SMPL_EFFORT_DEFAULT, _SMPL_VELOCITY_DEFAULT
 )
 
 
+# ----------------------------------------------------------------------
+# Resolved config
+# ----------------------------------------------------------------------
+@dataclass
+class PolicyInputSpec:
+    """One entry from ``policy_inputs`` in the YAML sidecar.
+
+    Maps the ONNX input ``name`` (as ONNX rewrote it during export, e.g.
+    ``current_rigid_body_pos``) back to the dotted context ``key`` it was
+    sourced from (``current.rigid_body_pos``) plus the shape and kind
+    metadata needed to fill it at inference time.
+    """
+
+    name: str          # ONNX input name (after sanitization)
+    key: str           # Dotted context key (current.rigid_body_pos, ...)
+    shape: List[int]   # Full shape including the leading batch dim
+    kind: Optional[str] = None
+    output_key: Optional[str] = None  # For historical inputs that feed back
+
+
+@dataclass
+class PolicyOutputSpec:
+    """One entry from ``policy_outputs`` in the YAML sidecar."""
+
+    name: str          # ONNX output name (actions, joint_pos_targets, ...)
+    key: str
+    kind: str
+    shape: List[int]
+    joint_names: Optional[List[str]] = None
+
+
 @dataclass
 class ResolvedConfig:
-    """Subset of fields we actually use during inference."""
+    """Inference-time configuration assembled from the ONNX sidecar YAML."""
 
+    # Joint / body schema.
     body_names: List[str] = field(default_factory=lambda: list(SMPL_BODY_NAMES))
     dof_names: List[str] = field(default_factory=lambda: list(SMPL_DOF_NAMES))
-    # Per-body parent index (length == ``num_bodies``); root is ``-1``.
-    # Used by :class:`ppp.robot_chain.RobotChain` to walk the chain when
-    # computing body velocities from joint state. Defaults to the SMPL
-    # tree so PPP boots correctly when the checkpoint .pt is missing.
     parent_indices: List[int] = field(
         default_factory=lambda: list(SMPL_PARENT_INDICES)
     )
 
-    pd_action_offset: List[float] = field(default_factory=lambda: [0.0] * 69)
-    pd_action_scale: List[float] = field(default_factory=lambda: [math.pi] * 69)
-    action_transform: str = "tanh"
-    clamp_value: float = 1.0
-
-    # Per-DOF physical PD gains and limits, mirroring the trainer's
-    # ``robot.control.control_info`` dict (resolved via
-    # ``override_control_info`` regex matching at training time). The
-    # checkpoint yaml carries these per-DOF; we read them out of the
-    # .pt file and fall back to the SMPL group table if absent. PPP
-    # writes them into the runtime USD as
-    # ``drive:rot{X,Y,Z}:physics:stiffness/damping/maxForce`` and
-    # ``physxJoint:maxJointVelocity`` so ovphysx's built-in articulation
-    # PD matches the trainer's solver-implicit PD numerically.
+    # Per-DOF PD gains. With the unified-pipeline export the policy
+    # also emits per-step ``stiffness_targets`` / ``damping_targets``
+    # but PPP keeps the gains static (USD-authored) and uses the
+    # defaults from the YAML as the single source of truth — see
+    # CHANGELOG for the dynamic-gain caveat.
     pd_stiffness: List[float] = field(
         default_factory=lambda: list(_SMPL_KP_DEFAULT)
     )
@@ -149,34 +159,61 @@ class ResolvedConfig:
         default_factory=lambda: list(_SMPL_VELOCITY_DEFAULT)
     )
 
-    # USD ``drive:rot*:physics:type`` token. ``"acceleration"`` mirrors
-    # IsaacLab's ``ImplicitActuatorCfg`` (the trainer's actuator model
-    # for this checkpoint): the solver mass-normalises the torque so a
-    # given (kp, kd) produces the same closed-loop dynamics regardless
-    # of inertia. ``"force"`` is the upstream USDA default and behaves
-    # like a raw torque drive — same numbers, different response. See
-    # CHANGELOG / phase-A audit for why this matters.
-    drive_type: str = "acceleration"
+    # USD ``drive:rot*:physics:type`` token. ``"force"`` matches what
+    # the trainer actually runs on IsaacLab.
+    #
+    # The previous default here was ``"acceleration"`` with a comment
+    # claiming it mirrored IsaacLab's ``ImplicitActuatorCfg``. That
+    # was wrong: per the IsaacLab actuator docs
+    # (https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.actuators.html#implicit-actuator)
+    # ``ImplicitActuator`` "does not perform its own computations on
+    # the joint action that needs to be applied to the simulation" —
+    # the articulation just writes ``stiffness`` / ``damping`` into
+    # the PhysX PD and inherits the drive type from whatever the USD
+    # authors. The upstream ``smpl_humanoid.usda`` authors
+    # ``"force"`` (see the historical note in assets.py — "the
+    # upstream USDA's `force` drives"), so the trainer's effective
+    # drive type is ``"force"``.
+    #
+    # ``"acceleration"`` makes PhysX multiply the gain by each joint's
+    # effective inertia before integrating: stiffness 800 on a hip
+    # with ~5 kg·m² of reflected leg inertia becomes effective
+    # torque-stiffness 4000 N·m/rad, ~5× what the policy trained
+    # against. That mismatch is enough to make even ``--bypass-policy``
+    # (motion's own DOFs piped straight to the PD) lose balance — the
+    # PD overshoots, oscillates, and the character falls. Diagnosed
+    # against trainer-vs-PPP parity dumps where outputs matched
+    # bit-exact and motion lookup matched to fp32 noise, but the
+    # character still couldn't hold the pose.
+    drive_type: str = "force"
 
-    num_state_history_steps: int = 2
-    future_steps: int = 1
+    # Spawn lift. Not carried in the YAML; pinned to ProtoMotions'
+    # canonical 5 cm character clearance.
     ref_respawn_offset_z: float = 0.05
 
-    # Simulator timing (training defaults for IsaacLab; the policy was trained
-    # on a 120Hz physics step with decimation=4 → 30Hz policy tick).
-    #
-    # ``substeps`` is the IsaacGym-style "PhysX substeps per fps step" knob
-    # (``IsaacGymSimParams.substeps`` defaults to 2). The trained policy's
-    # PhysX integrator advances at ``1 / (physics_fps * substeps)`` seconds
-    # per substep — for the canonical IsaacGym SMPL config that's
-    # ``1 / (60 * 2) = 1/120 s``, even though ``fps`` itself is 60. PPP
-    # exposes this via :pyattr:`dt_physics` and uses it as the per-substep
-    # ``dt`` argument to ``ovphysx.PhysX.step``. Defaults to ``substeps=1``
-    # so the IsaacLab-style configs (``fps=120``, no substeps) still
-    # integrate at 120Hz.
-    physics_fps: int = 120
+    # Control timing (from YAML ``timing.*``).
+    control_dt: float = 1.0 / 30.0
+    physics_dt: float = 1.0 / 120.0
     decimation: int = 4
-    substeps: int = 1
+
+    # Mimic future look-ahead. ``future_step_indices`` is the canonical
+    # source — a list of integer offsets in units of ``control_dt``
+    # (e.g. ``[1]`` means "one control step ahead"). ``future_steps``
+    # is kept as a derived count for downstream consumers that just
+    # want the length.
+    future_step_indices: List[int] = field(default_factory=lambda: [1])
+
+    # ONNX-side schema, mirrors the YAML's ``policy_inputs`` /
+    # ``policy_outputs`` blocks. Sorted in YAML order so callers can
+    # iterate them deterministically.
+    policy_inputs: List[PolicyInputSpec] = field(default_factory=list)
+    policy_outputs: List[PolicyOutputSpec] = field(default_factory=list)
+
+    # Path to the YAML the config was loaded from (None when defaults).
+    yaml_path: Optional[Path] = None
+    # Path to the ONNX file the YAML was discovered for (None when
+    # the YAML was loaded explicitly).
+    onnx_path: Optional[Path] = None
 
     @property
     def num_bodies(self) -> int:
@@ -187,245 +224,235 @@ class ResolvedConfig:
         return len(self.dof_names)
 
     @property
+    def future_steps(self) -> int:
+        return len(self.future_step_indices)
+
+    @property
     def policy_fps(self) -> float:
-        return self.physics_fps / self.decimation
+        return 1.0 / self.control_dt
+
+    @property
+    def physics_fps(self) -> float:
+        return 1.0 / self.physics_dt
 
     @property
     def dt_physics(self) -> float:
-        """Substep ``dt`` (seconds) the trained PhysX integrator used.
+        """Substep ``dt`` (seconds) — alias for ``physics_dt``."""
+        return self.physics_dt
 
-        ``1 / (physics_fps * substeps)``. For an IsaacLab SMPL config
-        (``fps=120``, ``substeps=1``) this is ``1/120 s``. For an
-        IsaacGym SMPL config (``fps=60``, ``substeps=2``) it's *also*
-        ``1/120 s`` — the substeps multiplier is what makes the two
-        training paths share an integrator rate despite different
-        nominal ``fps``.
-        """
-        return 1.0 / (self.physics_fps * max(1, self.substeps))
+    def get_input_spec(self, name: str) -> Optional[PolicyInputSpec]:
+        for spec in self.policy_inputs:
+            if spec.name == name:
+                return spec
+        return None
 
-
-def _maybe_list(v: Any, n: int, default: float) -> List[float]:
-    if v is None:
-        return [default] * n
-    if hasattr(v, "tolist"):
-        try:
-            v = v.tolist()
-        except Exception:
-            pass
-    if isinstance(v, (list, tuple)):
-        return [float(x) for x in v]
-    return [float(v)] * n
+    def get_input_spec_by_key(self, key: str) -> Optional[PolicyInputSpec]:
+        for spec in self.policy_inputs:
+            if spec.key == key:
+                return spec
+        return None
 
 
-def _dig(obj: Any, *keys: str, default: Any = None) -> Any:
-    """Best-effort nested attribute/dict lookup."""
-    cur = obj
-    for k in keys:
-        if cur is None:
-            return default
-        if isinstance(cur, dict):
-            cur = cur.get(k, default if k == keys[-1] else None)
-        else:
-            cur = getattr(cur, k, default if k == keys[-1] else None)
-    return cur if cur is not None else default
+# ----------------------------------------------------------------------
+# YAML discovery / loading
+# ----------------------------------------------------------------------
+def discover_yaml_sidecar(onnx_path: Path | str) -> Optional[Path]:
+    """Find the unified-pipeline YAML next to an ONNX file.
 
+    Search order:
 
-def load_resolved_config(checkpoint_path: Optional[Path | str]) -> ResolvedConfig:
-    """Try to load ``resolved_configs_inference.pt`` next to ``checkpoint_path``.
+    1. ``<onnx_stem>.yaml`` (the canonical export-script naming).
+    2. ``<onnx_parent>/unified_pipeline.yaml`` (fallback name the
+       upstream export script uses when the model file was renamed).
+    3. Any single ``*.yaml`` file in the same directory.
 
-    Returns the default SMPL config if anything goes wrong (with a warning).
+    Returns ``None`` if no candidate is found; the caller decides
+    whether to fall back to the built-in defaults.
     """
-    cfg = ResolvedConfig()
-    if checkpoint_path is None:
-        return cfg
+    onnx_path = Path(onnx_path).resolve()
+    candidates: List[Path] = []
+    stem_yaml = onnx_path.with_suffix(".yaml")
+    if stem_yaml.exists():
+        candidates.append(stem_yaml)
+    pipeline_yaml = onnx_path.parent / "unified_pipeline.yaml"
+    if pipeline_yaml.exists() and pipeline_yaml not in candidates:
+        candidates.append(pipeline_yaml)
+    if not candidates:
+        siblings = sorted(onnx_path.parent.glob("*.yaml"))
+        if len(siblings) == 1:
+            candidates.append(siblings[0])
 
-    ckpt = Path(checkpoint_path).resolve()
-    pt_path = ckpt.parent / "resolved_configs_inference.pt"
-    if not pt_path.exists():
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _coerce_int_list(v: Any) -> List[int]:
+    if v is None:
+        return []
+    if hasattr(v, "tolist"):
+        v = v.tolist()
+    return [int(x) for x in v]
+
+
+def _coerce_float_list(v: Any, n: int, default: List[float]) -> List[float]:
+    if v is None:
+        return list(default)
+    if hasattr(v, "tolist"):
+        v = v.tolist()
+    out = [float(x) for x in v]
+    if len(out) != n:
         log.warning(
-            "%s not found — using built-in SMPL defaults. "
-            "This should still match the smpl_policy_orig export.",
-            pt_path,
+            "Per-DOF list has %d entries, expected %d; padding with defaults.",
+            len(out),
+            n,
         )
-        return cfg
+        if len(out) < n:
+            out = out + list(default[len(out):])
+        else:
+            out = out[:n]
+    return out
 
-    try:
-        import torch
 
-        log.info("Loading resolved configs from %s", pt_path)
-        blob = torch.load(pt_path, map_location="cpu", weights_only=False)
-    except Exception as e:  # pragma: no cover - falls back gracefully
-        log.warning("Failed to torch.load(%s): %s. Using defaults.", pt_path, e)
-        return cfg
+def _parse_input_spec(entry: Dict[str, Any]) -> PolicyInputSpec:
+    return PolicyInputSpec(
+        name=str(entry["name"]),
+        key=str(entry.get("key", entry["name"])),
+        shape=[int(x) for x in entry.get("shape", [])],
+        kind=entry.get("kind"),
+        output_key=entry.get("output_key"),
+    )
 
-    # The pt blob is structured as
-    #   {"robot": RobotConfig, "simulator": SimulatorConfig,
-    #    "env": EnvConfig, "agent": PPOAgentConfig, ...}
-    # We pull the relevant fields out of ``robot`` and ``env``.
-    if isinstance(blob, dict):
-        robot_cfg = blob.get("robot")
-        env_cfg = blob.get("env")
-        sim_cfg = blob.get("simulator")
-    else:
-        robot_cfg = getattr(blob, "robot", None)
-        env_cfg = getattr(blob, "env", None)
-        sim_cfg = getattr(blob, "simulator", None)
 
-    if env_cfg is None:
-        log.warning("resolved_configs_inference.pt missing 'env'; using defaults.")
-        return cfg
+def _parse_output_spec(entry: Dict[str, Any]) -> PolicyOutputSpec:
+    return PolicyOutputSpec(
+        name=str(entry["name"]),
+        key=str(entry.get("key", entry["name"])),
+        kind=str(entry.get("kind", "")),
+        shape=[int(x) for x in entry.get("shape", [])],
+        joint_names=(
+            list(entry["joint_names"]) if entry.get("joint_names") else None
+        ),
+    )
 
-    body_names = _dig(robot_cfg, "kinematic_info", "body_names")
-    dof_names = _dig(robot_cfg, "kinematic_info", "dof_names")
+
+def load_config_from_yaml(
+    yaml_path: Path | str,
+    onnx_path: Optional[Path | str] = None,
+) -> ResolvedConfig:
+    """Parse a unified-pipeline YAML sidecar into a :class:`ResolvedConfig`.
+
+    The YAML schema is the one produced by
+    ``deployment/export_bm_tracker_onnx.py::_build_yaml``. Unknown fields
+    are ignored so PPP keeps working when the export script grows new
+    keys.
+    """
+    import yaml
+
+    yaml_path = Path(yaml_path).resolve()
+    log.info("Loading model config from %s", yaml_path)
+    with yaml_path.open("r", encoding="utf-8") as f:
+        blob: Dict[str, Any] = yaml.safe_load(f) or {}
+
+    cfg = ResolvedConfig(
+        yaml_path=yaml_path,
+        onnx_path=Path(onnx_path).resolve() if onnx_path is not None else None,
+    )
+
+    body_names = blob.get("body_names") or (blob.get("robot") or {}).get("body_names")
+    joint_names = blob.get("joint_names") or (blob.get("robot") or {}).get("joint_names")
     if body_names:
-        cfg.body_names = list(body_names)
-    if dof_names:
-        cfg.dof_names = list(dof_names)
-
-    parent_indices = _dig(robot_cfg, "kinematic_info", "parent_indices")
-    if parent_indices is not None:
-        try:
-            if hasattr(parent_indices, "tolist"):
-                parent_indices = parent_indices.tolist()
-            cfg.parent_indices = [int(p) for p in parent_indices]
-        except Exception:
-            log.warning(
-                "Failed to parse robot.kinematic_info.parent_indices; "
-                "falling back to hard-coded SMPL tree."
-            )
-
-    # ``robot.control.control_info`` is a per-DOF dict with the keys
-    # ``stiffness`` / ``damping`` / ``effort_limit`` / ``velocity_limit``
-    # (and ``armature`` / ``friction``, which we don't currently
-    # plumb). The checkpoint resolves the ``override_control_info``
-    # regexes into a flat per-DOF dict, so we just look up each DOF
-    # name. If the .pt carries a different control model (e.g. raw
-    # torque) we leave the SMPL fallback in place — PPP only
-    # supports BUILT_IN_PD for now.
-    control_info = _dig(robot_cfg, "control", "control_info")
-    if control_info is not None:
-        try:
-            kp_list: List[float] = []
-            kd_list: List[float] = []
-            eff_list: List[float] = []
-            vel_list: List[float] = []
-            for dof in cfg.dof_names:
-                entry: Any = None
-                if isinstance(control_info, dict):
-                    entry = control_info.get(dof)
-                else:
-                    entry = getattr(control_info, dof, None)
-                if entry is None:
-                    raise KeyError(f"control_info missing entry for {dof!r}")
-                kp_list.append(float(_dig(entry, "stiffness")))
-                kd_list.append(float(_dig(entry, "damping")))
-                eff_list.append(float(_dig(entry, "effort_limit")))
-                vel_list.append(float(_dig(entry, "velocity_limit")))
-            cfg.pd_stiffness = kp_list
-            cfg.pd_damping = kd_list
-            cfg.pd_effort_limit = eff_list
-            cfg.pd_velocity_limit = vel_list
-        except Exception as e:
-            log.warning(
-                "Failed to parse robot.control.control_info (%s); "
-                "falling back to hard-coded SMPL group gains.",
-                e,
-            )
+        cfg.body_names = [str(n) for n in body_names]
+    if joint_names:
+        cfg.dof_names = [str(n) for n in joint_names]
 
     num_dofs = len(cfg.dof_names)
-    ac = _dig(env_cfg, "action_config", default={})
-    cfg.pd_action_offset = _maybe_list(_dig(ac, "pd_action_offset"), num_dofs, 0.0)
-    cfg.pd_action_scale = _maybe_list(_dig(ac, "pd_action_scale"), num_dofs, math.pi)
-    transform = _dig(ac, "action_transform")
-    if transform:
-        cfg.action_transform = str(transform)
-    clamp = _dig(ac, "clamp_value")
-    if clamp is not None:
-        try:
-            cfg.clamp_value = float(clamp)
-        except Exception:
-            pass
 
-    nshs = _dig(env_cfg, "num_state_history_steps")
-    if nshs is not None:
-        try:
-            cfg.num_state_history_steps = int(nshs)
-        except Exception:
-            pass
+    # PD gains: prefer the deployment-contract ``control`` block, fall
+    # back to the top-level ``default_joint_*`` arrays, then the SMPL
+    # group fallback.
+    control = blob.get("control") or {}
+    stiffness = (
+        control.get("stiffness")
+        if control.get("stiffness") is not None
+        else blob.get("default_joint_stiffness")
+    )
+    damping = (
+        control.get("damping")
+        if control.get("damping") is not None
+        else blob.get("default_joint_damping")
+    )
+    effort = control.get("effort_limits")
+    velocity = control.get("velocity_limits")
 
-    fs = _dig(env_cfg, "control_components", "mimic", "future_steps")
-    if fs is None:
-        # Try the mimic_obs / mimic_target_poses observation component path.
-        fs = _dig(env_cfg, "observation_components", "mimic_target_poses", "future_steps")
-    if fs is not None:
-        try:
-            cfg.future_steps = int(fs)
-        except Exception:
-            pass
+    cfg.pd_stiffness = _coerce_float_list(stiffness, num_dofs, _SMPL_KP_DEFAULT)
+    cfg.pd_damping = _coerce_float_list(damping, num_dofs, _SMPL_KD_DEFAULT)
+    cfg.pd_effort_limit = _coerce_float_list(
+        effort, num_dofs, _SMPL_EFFORT_DEFAULT
+    )
+    cfg.pd_velocity_limit = _coerce_float_list(
+        velocity, num_dofs, _SMPL_VELOCITY_DEFAULT
+    )
 
-    rro = _dig(env_cfg, "control_components", "mimic", "ref_respawn_offset")
-    if rro is None:
-        rro = _dig(env_cfg, "control_components", "mimic", "respawn_offset_z")
-    if rro is not None:
-        try:
-            cfg.ref_respawn_offset_z = float(rro)
-        except Exception:
-            pass
+    timing = blob.get("timing") or {}
+    if timing.get("control_dt") is not None:
+        cfg.control_dt = float(timing["control_dt"])
+    elif blob.get("dt") is not None:
+        cfg.control_dt = float(blob["dt"])
+    if timing.get("physics_dt") is not None:
+        cfg.physics_dt = float(timing["physics_dt"])
+    if timing.get("decimation") is not None:
+        cfg.decimation = int(timing["decimation"])
 
-    # SimulatorConfig nests fps/decimation under a ``sim`` (SimParams)
-    # field — see ``protomotions/simulator/base_simulator/config.py``.
-    # Earlier versions of this loader dug ``sim_cfg.fps`` directly,
-    # which returns None against the canonical layout and silently fell
-    # back to the 120/4 defaults. We try the nested location first and
-    # fall through to the legacy flat lookup for forward compatibility.
-    fps = _dig(sim_cfg, "sim", "fps")
-    if fps is None:
-        fps = _dig(sim_cfg, "fps")
-    if fps is not None:
-        try:
-            cfg.physics_fps = int(fps)
-        except Exception:
-            pass
-    dec = _dig(sim_cfg, "sim", "decimation")
-    if dec is None:
-        dec = _dig(sim_cfg, "decimation")
-    if dec is not None:
-        try:
-            cfg.decimation = int(dec)
-        except Exception:
-            pass
+    motion = blob.get("motion") or {}
+    fsi = _coerce_int_list(motion.get("future_step_indices"))
+    if fsi:
+        cfg.future_step_indices = fsi
 
-    # IsaacGym/Genesis-style configs add a ``substeps`` field on top of
-    # ``fps`` (PhysX-internal solver substeps inside a single 1/fps step
-    # — see ``protomotions/simulator/isaacgym/config.py``). PPP threads
-    # this through to ``PhysxWorld`` as the per-substep ``dt`` so the
-    # actual integrator rate matches what the policy was trained on:
-    # ``IsaacGym SMPL`` has ``fps=60, substeps=2`` ⇒ 1/120 s substep,
-    # ``IsaacLab SMPL`` has ``fps=120, substeps=1`` ⇒ 1/120 s substep.
-    # Without the multiplication PPP would silently integrate the
-    # IsaacGym checkpoint at half the trained solver rate.
-    substeps = _dig(sim_cfg, "sim", "substeps")
-    if substeps is None:
-        substeps = _dig(sim_cfg, "substeps")
-    if substeps is not None:
-        try:
-            cfg.substeps = max(1, int(substeps))
-        except Exception:
-            pass
+    cfg.policy_inputs = [
+        _parse_input_spec(e) for e in (blob.get("policy_inputs") or [])
+    ]
+    cfg.policy_outputs = [
+        _parse_output_spec(e) for e in (blob.get("policy_outputs") or [])
+    ]
 
     log.info(
-        "Resolved config: %d bodies, %d DOFs, fps=%d/decimation=%d/substeps=%d "
-        "(policy=%.1f Hz, integrator=%.1f Hz), future_steps=%d, "
-        "num_state_history=%d, action_transform=%s.",
+        "Resolved config: %d bodies, %d DOFs, control_dt=%.4fs (%.1f Hz), "
+        "physics_dt=%.4fs (%.1f Hz), decimation=%d, future_step_indices=%s, "
+        "%d policy inputs / %d policy outputs.",
         cfg.num_bodies,
         cfg.num_dofs,
+        cfg.control_dt,
+        cfg.policy_fps,
+        cfg.physics_dt,
         cfg.physics_fps,
         cfg.decimation,
-        cfg.substeps,
-        cfg.policy_fps,
-        1.0 / cfg.dt_physics,
-        cfg.future_steps,
-        cfg.num_state_history_steps,
-        cfg.action_transform,
+        cfg.future_step_indices,
+        len(cfg.policy_inputs),
+        len(cfg.policy_outputs),
     )
     return cfg
+
+
+def load_config_for_onnx(
+    onnx_path: Path | str,
+    explicit_yaml: Optional[Path | str] = None,
+) -> ResolvedConfig:
+    """Load the model config for an ONNX file, auto-discovering the sidecar.
+
+    If ``explicit_yaml`` is provided, that path is used unconditionally.
+    Otherwise we look next to the ONNX file using
+    :func:`discover_yaml_sidecar`. If nothing matches we raise — the
+    unified-pipeline ONNX is unusable without its schema.
+    """
+    if explicit_yaml is not None:
+        return load_config_from_yaml(explicit_yaml, onnx_path=onnx_path)
+
+    yaml_path = discover_yaml_sidecar(onnx_path)
+    if yaml_path is None:
+        raise FileNotFoundError(
+            f"No YAML sidecar found next to {onnx_path!s}. Expected one of "
+            "<stem>.yaml, unified_pipeline.yaml, or a single *.yaml in the "
+            "same folder. Pass --yaml to override."
+        )
+    return load_config_from_yaml(yaml_path, onnx_path=onnx_path)

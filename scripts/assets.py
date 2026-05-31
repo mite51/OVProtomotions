@@ -130,18 +130,23 @@ class JointGains:
     future config splits per-axis, this dataclass would gain
     ``stiffness_x/y/z`` etc.
 
-    ``drive_type`` is the USD drive token: ``"acceleration"`` mirrors
-    IsaacLab's ``ImplicitActuatorCfg`` (mass-normalised PD),
-    ``"force"`` is the upstream USDA default (raw torque PD). The
-    gains are numerically identical across the two modes; only the
-    closed-loop response changes — see CHANGELOG / phase-A audit.
+    ``drive_type`` is the USD drive token. ``"force"`` is the raw
+    torque PD (gain in N·m/rad) and is what the trainer actually
+    runs on IsaacLab — ``ImplicitActuatorCfg`` hands the gains
+    straight to PhysX without overriding the USD's authored drive
+    type, and the upstream ``smpl_humanoid.usda`` authors ``"force"``.
+    ``"acceleration"`` is a mass-normalised mode where the gain is
+    multiplied by each joint's effective inertia before integration
+    — same number on the dial, very different effective torque on
+    heavy joints (e.g. ~5× on a hip), and the policy will not balance
+    under it because it was trained against force-mode response.
     """
 
     stiffness: float
     damping: float
     effort_limit: float
     velocity_limit: float
-    drive_type: str = "acceleration"
+    drive_type: str = "force"
 
 
 def per_joint_gains_from_config(
@@ -316,11 +321,18 @@ def _smpl_joint_overs(
     every SMPL joint Xform and authors the full PD drive
     configuration:
 
-    - ``drive:rot{X,Y,Z}:physics:type`` — ``"acceleration"`` (matches
-      IsaacLab's ``ImplicitActuatorCfg``) by default. The upstream
-      ``smpl_humanoid.usda`` ships ``"force"``, which makes the same
-      kp/kd values mean different torques per body because PhysX
-      doesn't mass-normalise force drives.
+    - ``drive:rot{X,Y,Z}:physics:type`` — ``"force"`` by default,
+      matching what the trainer actually runs. IsaacLab's
+      ``ImplicitActuatorCfg`` hands ``stiffness`` / ``damping`` to
+      PhysX without overriding the USD's drive type, and the upstream
+      ``smpl_humanoid.usda`` ships ``"force"`` — so the trainer
+      effectively runs force-mode PD (gain in N·m/rad). Switching to
+      ``"acceleration"`` makes PhysX multiply the gain by each
+      joint's effective inertia (mass-normalised PD); the SAME number
+      then yields ~5× the torque on a hip, the policy fails to
+      balance because it was trained against force-mode dynamics, and
+      even ``--bypass-policy`` (motion DOFs piped straight to the PD)
+      falls.
     - ``drive:rot{X,Y,Z}:physics:stiffness`` / ``damping`` — pulled
       from the resolved checkpoint so the gains track whatever the
       trainer used. Falls back to the SMPL group table baked in
@@ -333,8 +345,9 @@ def _smpl_joint_overs(
       ``velocity_limit`` (100 rad/s for SMPL); not in upstream USDA.
 
     If ``joint_gains`` is ``None`` we keep the legacy behaviour
-    (only maxForce + maxJointVelocity, drive type stays at upstream
-    USDA's ``force``) so old callers still work.
+    (only maxForce + maxJointVelocity; drive type stays at upstream
+    USDA's ``"force"``, which is the trainer-equivalent value) so
+    old callers still work.
     """
     joint_blocks: list[str] = []
     indent = " " * 8

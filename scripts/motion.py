@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import torch
 
@@ -157,18 +157,42 @@ class MotionPlayer:
         )
 
     def get_future(
-        self, t: float, dt: float, n: int = 1
+        self,
+        t: float,
+        dt: float,
+        n: int = 1,
+        step_indices: Sequence[int] | None = None,
     ) -> MotionFuture:
-        """Future poses at times ``t + dt * [1..n]``, clamped to motion length.
+        """Future poses at times ``t + dt * step_indices``, clamped to motion length.
 
         Reference body positions are Z-offset (see :meth:`get_state`).
-        """
-        if n <= 0:
-            raise ValueError(f"n must be > 0, got {n}.")
 
-        # Sample one frame per step, batched as motion_id=0 repeated n times.
-        ids = torch.zeros(n, dtype=torch.long, device=self.device)
-        offsets = torch.arange(1, n + 1, device=self.device, dtype=torch.float32) * dt
+        Args:
+            t: Current motion time in seconds.
+            dt: Step size in seconds (typically the trained control_dt).
+            n: Convenience shorthand for ``step_indices=[1..n]``. Ignored
+                when ``step_indices`` is provided explicitly.
+            step_indices: Explicit list of integer offsets (in units of
+                ``dt``) at which to sample the motion. Mirrors the
+                trainer's ``MimicControlConfig.future_step_indices``
+                ([1] = "one control step ahead"). Required when the
+                unified-pipeline YAML declares non-contiguous offsets.
+        """
+        if step_indices is not None:
+            indices = list(step_indices)
+        else:
+            if n <= 0:
+                raise ValueError(f"n must be > 0, got {n}.")
+            indices = list(range(1, n + 1))
+
+        n_steps = len(indices)
+        if n_steps == 0:
+            raise ValueError("step_indices must contain at least one offset.")
+
+        ids = torch.zeros(n_steps, dtype=torch.long, device=self.device)
+        offsets = torch.tensor(
+            indices, device=self.device, dtype=torch.float32
+        ) * dt
         times = torch.clamp(t + offsets, min=0.0, max=self._motion_length)
 
         rs = self._lib.get_motion_state(ids, times)
